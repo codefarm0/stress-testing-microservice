@@ -1,0 +1,175 @@
+# Phase A: synchronous flow + full observability stack.
+# Run from the project root:  docker compose -f infra/docker-compose.yml up -d --build
+name: stress-test
+
+x-small: &small
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "3" }
+
+services:
+
+  # ---------------------------------------------------------------- system under test
+  order-service:
+    <<: *small
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: order-service:latest
+    container_name: order-service
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVICE_NAME: order-service
+      DB_HOST: mysql
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_POOL_TIMEOUT_MS: ${DB_POOL_TIMEOUT_MS:-3000}
+      TOMCAT_MAX_THREADS: ${TOMCAT_MAX_THREADS:-200}
+      TOMCAT_ACCEPT_COUNT: ${TOMCAT_ACCEPT_COUNT:-100}
+      ORDER_LOG_LEVEL: ${ORDER_LOG_LEVEL:-INFO}
+    ports: ["8080:8080"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPUS:-1.0}"
+          memory: ${APP_MEMORY:-512M}
+
+  # ---------------------------------------------------------------- data
+  mysql:
+    <<: *small
+    image: mysql:8.4
+    container_name: mysql123
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: orders
+      MYSQL_USER: orders
+      MYSQL_PASSWORD: orders
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/stress.cnf:ro
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "${MYSQL_CPUS:-2.0}"
+          memory: ${MYSQL_MEMORY:-1G}
+
+  mysqld-exporter:
+    <<: *small
+    image: prom/mysqld-exporter:v0.17.2
+    container_name: mysqld-exporter
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: exporter
+    command:
+      - --mysqld.address=mysql:3306
+      - --mysqld.username=exporter
+      - --collect.info_schema.innodb_metrics
+      - --collect.global_status
+      - --collect.perf_schema.eventswaits
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M }
+
+  # ---------------------------------------------------------------- observability
+  prometheus:
+    <<: *small
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-remote-write-receiver     # k6 pushes its metrics here
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1G }
+
+  cadvisor:
+    <<: *small
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    privileged: true
+    devices: ["/dev/kmsg"]
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=5s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service,com.docker.compose.project
+      - --disable_metrics=disk,diskIO,tcp,udp,percpu,sched,process,hugetlb,referenced_memory,resctrl
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports: ["8081:8080"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  loki:
+    <<: *small
+    image: grafana/loki:3.5.3
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports: ["3100:3100"]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  alloy:
+    <<: *small
+    image: grafana/alloy:v1.10.0
+    container_name: alloy
+    depends_on: [loki]
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports: ["12345:12345"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  grafana:
+    <<: *small
+    image: grafana/grafana:12.1.0
+    container_name: grafana
+    depends_on: [prometheus, loki]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/order-service.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+volumes:
+  mysql-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:

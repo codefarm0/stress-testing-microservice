@@ -1,0 +1,90 @@
+spring:
+  application:
+    name: ${SERVICE_NAME:order-service}
+
+  threads:
+    virtual:
+      enabled: false          # classic platform-thread model on purpose: we want to SEE thread exhaustion
+
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:orders}?useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
+    username: ${DB_USER:orders}
+    password: ${DB_PASSWORD:orders}
+    hikari:
+      pool-name: order-pool
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: ${DB_POOL_SIZE:10}
+      connection-timeout: ${DB_POOL_TIMEOUT_MS:3000}   # wait at most 3s for a connection -> then 503
+      max-lifetime: 600000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate      # schema is owned by Flyway
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: 8080
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:200}
+      min-spare: 20
+    accept-count: ${TOMCAT_ACCEPT_COUNT:100}
+    max-connections: 8192
+    mbeanregistry:
+      enabled: true           # exposes tomcat_threads_* metrics
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        orders.reserve.duration: true
+        hikaricp.connections.acquire: true
+      slo:
+        http.server.requests: 10ms,50ms,100ms,250ms,500ms,1s,2s,5s,10s
+
+# --- what the app logs -------------------------------------------------------
+order:
+  stats:
+    interval: 5s              # periodic "what is happening right now" summary line
+
+logging:
+  level:
+    root: INFO
+    in.codefarm: INFO
+    # one line per order (INFO confirmed / WARN rejected / ERROR failed).
+    # For the highest-load runs ORDER_LOG_LEVEL=WARN drops the INFO lines (logging costs CPU too).
+    in.codefarm.stress_testing_microservice.order: ${ORDER_LOG_LEVEL:INFO}
+    com.zaxxer.hikari: INFO
+    org.hibernate.SQL: ${SQL_LOG_LEVEL:WARN}
+
+---
+# Inside Docker: JSON logs so Alloy/Loki can parse level, logger, MDC, key-values
+spring:
+  config:
+    activate:
+      on-profile: docker
+logging:
+  structured:
+    format:
+      console: logstash

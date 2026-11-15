@@ -1,0 +1,8 @@
+.gradle
+build
+.idea
+infra
+k6
+results
+*.md
+docs

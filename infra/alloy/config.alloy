@@ -1,0 +1,54 @@
+// Collect logs of every container in the "stress-test" compose project and ship them to Loki.
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "stress-test"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.containers.output
+  forward_to       = [loki.process.app.receiver]
+  refresh_interval = "5s"
+}
+
+loki.process "app" {
+  // Spring Boot services log JSON (logstash format): lift "level" and "logger" into labels.
+  stage.match {
+    selector = "{service=~\"order-.*\"}"
+
+    stage.json {
+      expressions = { level = "level", logger = "logger_name" }
+    }
+    stage.labels {
+      values = { level = "", logger = "" }
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
